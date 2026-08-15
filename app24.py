@@ -61,6 +61,23 @@ def add_audio_to_video(original_video_path, video_no_audio_path, output_path):
     except subprocess.CalledProcessError as e:
         return False, str(e)
 
+def count_frames_fast(video_path):
+    """Быстрый подсчёт кадров через ffprobe, без полного декодирования."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-count_packets", "-show_entries", "stream=nb_read_packets",
+            "-of", "csv=p=0", video_path
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return int(out.stdout.strip())
+    except Exception:
+        # fallback: OpenCV estimate
+        cap = cv2.VideoCapture(video_path)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return max(n, 1)
+
 def get_fps(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -525,10 +542,11 @@ def swap_video_custom_mapping(src_imgs, video, mapping_str, delete_frames_dir=Tr
 # ─────────────────────────────────────────────
 
 def _process_one_video(args):
-    """Обрабатывает одно видео из батча."""
+    """Обрабатывает одно видео из батча. Отчитывается о каждом кадре через shared_counter."""
     (
         video_path, src_path, frame_worker_fn, frame_args_builder_fn,
-        base_dir, i, add_audio, delete_frames_dir, copy_to_drive
+        base_dir, i, add_audio, delete_frames_dir, copy_to_drive,
+        shared_counter, counter_lock, on_frame_done
     ) = args
 
     vid_name = os.path.basename(video_path) if isinstance(video_path, str) else f"vid_{i}.mp4"
@@ -547,10 +565,16 @@ def _process_one_video(args):
 
     args_list = frame_args_builder_fn(frame_paths, swapped_dir, src_path, i)
 
+    def _wrapped(a):
+        frame_worker_fn(a)
+        with counter_lock:
+            shared_counter[0] += 1
+            on_frame_done(shared_counter[0])
+
     # Внутри батча используем меньше воркеров чтобы не конкурировать
     inner_workers = max(1, NUM_WORKERS // 2)
     with ThreadPoolExecutor(max_workers=inner_workers) as ex:
-        list(ex.map(frame_worker_fn, args_list))
+        list(ex.map(_wrapped, args_list))
 
     frames_to_video_fast(swapped_dir, out_no_audio, fps)
 
@@ -594,22 +618,43 @@ def swap_single_src_multi_video(src_img, dst_videos, dst_indices, delete_frames_
             for i, fp in enumerate(frame_paths)
         ]
 
+    # Считаем общее число кадров заранее, чтобы прогресс был честным (по кадрам, не по видео)
+    progress(0, desc="Counting frames...")
+    video_paths_resolved = [v if isinstance(v, str) else v.name for v in dst_videos]
+    total_frames = sum(count_frames_fast(vp) for vp in video_paths_resolved)
+    total_frames = max(total_frames, 1)
+
+    shared_counter = [0]
+    counter_lock = threading.Lock()
+    start_t = time.time()
+
+    def on_frame_done(done_frames):
+        elapsed = time.time() - start_t
+        avg = elapsed / done_frames if done_frames else 0
+        remaining = avg * (total_frames - done_frames)
+        m, s = divmod(int(remaining), 60)
+        progress(
+            min(done_frames / total_frames, 1.0),
+            desc=f"Frames {done_frames}/{total_frames} | ETA {m:02d}:{s:02d}"
+        )
+
     batch_args = [
         (v, src_path, _process_frame_single, frame_args_builder,
-         base, i, add_audio, delete_frames_dir, copy_to_drive)
+         base, i, add_audio, delete_frames_dir, copy_to_drive,
+         shared_counter, counter_lock, on_frame_done)
         for i, v in enumerate(dst_videos)
     ]
 
     results = []
-    done = [0]
+    done_videos = [0]
     with ThreadPoolExecutor(max_workers=2) as ex:  # 2 видео параллельно
         futs = {ex.submit(_process_one_video, a): i for i, a in enumerate(batch_args)}
         for f in as_completed(futs):
             path = f.result()
             results.append(path)
-            done[0] += 1
-            progress(done[0] / len(dst_videos), desc=f"Video {done[0]}/{len(dst_videos)}")
+            done_videos[0] += 1
 
+    progress(1.0, desc="Done")
     log += f"Done {len(results)} videos in {time.time()-t:.1f}s\n"
     return sorted(results), log
 
@@ -632,21 +677,38 @@ def swap_batch_all_faces(src_img, video_files, num_faces_to_swap, delete_frames_
             for i, fp in enumerate(frame_paths)
         ]
 
+    progress(0, desc="Counting frames...")
+    video_paths_resolved = [v if isinstance(v, str) else v.name for v in video_files]
+    total_frames = max(sum(count_frames_fast(vp) for vp in video_paths_resolved), 1)
+
+    shared_counter = [0]
+    counter_lock = threading.Lock()
+    start_t = time.time()
+
+    def on_frame_done(done_frames):
+        elapsed = time.time() - start_t
+        avg = elapsed / done_frames if done_frames else 0
+        remaining = avg * (total_frames - done_frames)
+        m, s = divmod(int(remaining), 60)
+        progress(
+            min(done_frames / total_frames, 1.0),
+            desc=f"Frames {done_frames}/{total_frames} | ETA {m:02d}:{s:02d}"
+        )
+
     batch_args = [
         (v, src_path, _process_frame_all_faces, frame_args_builder,
-         base, i, add_audio, delete_frames_dir, copy_to_drive)
+         base, i, add_audio, delete_frames_dir, copy_to_drive,
+         shared_counter, counter_lock, on_frame_done)
         for i, v in enumerate(video_files)
     ]
 
     results = []
-    done = [0]
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = {ex.submit(_process_one_video, a): i for i, a in enumerate(batch_args)}
         for f in as_completed(futs):
             results.append(f.result())
-            done[0] += 1
-            progress(done[0] / len(video_files), desc=f"Video {done[0]}/{len(video_files)}")
 
+    progress(1.0, desc="Done")
     log += f"Done {len(results)} videos in {time.time()-t:.1f}s\n"
     return sorted(results), log
 
@@ -677,21 +739,38 @@ def swap_batch_custom(src_imgs, video_files, mapping_str, delete_frames_dir=True
             for i, fp in enumerate(frame_paths)
         ]
 
+    progress(0, desc="Counting frames...")
+    video_paths_resolved = [v if isinstance(v, str) else v.name for v in video_files]
+    total_frames = max(sum(count_frames_fast(vp) for vp in video_paths_resolved), 1)
+
+    shared_counter = [0]
+    counter_lock = threading.Lock()
+    start_t = time.time()
+
+    def on_frame_done(done_frames):
+        elapsed = time.time() - start_t
+        avg = elapsed / done_frames if done_frames else 0
+        remaining = avg * (total_frames - done_frames)
+        m, s = divmod(int(remaining), 60)
+        progress(
+            min(done_frames / total_frames, 1.0),
+            desc=f"Frames {done_frames}/{total_frames} | ETA {m:02d}:{s:02d}"
+        )
+
     batch_args = [
         (v, src_paths[0] if src_paths else "", _process_frame_custom, frame_args_builder,
-         base, i, add_audio, delete_frames_dir, copy_to_drive)
+         base, i, add_audio, delete_frames_dir, copy_to_drive,
+         shared_counter, counter_lock, on_frame_done)
         for i, v in enumerate(video_files)
     ]
 
     results = []
-    done = [0]
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = {ex.submit(_process_one_video, a): i for i, a in enumerate(batch_args)}
         for f in as_completed(futs):
             results.append(f.result())
-            done[0] += 1
-            progress(done[0] / len(video_files), desc=f"Video {done[0]}/{len(video_files)}")
 
+    progress(1.0, desc="Done")
     log += f"Done {len(results)} videos in {time.time()-t:.1f}s\n"
     return sorted(results), log
 
